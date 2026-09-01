@@ -2,7 +2,7 @@
 
 Local panel for FiveM. Write JS, hit run, watch traffic, block URLs — all from one window.
 
-![Arya FiveM Tool screenshot](assets/screenshot.jpg)
+![Arya FiveM Tool screenshot](screenshot.jpg)
 
 ## Run it
 
