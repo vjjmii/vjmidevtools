@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, Response, make_response
+from flask import Flask, request, jsonify, Response, make_response, send_from_directory
 from flask_cors import CORS
 import threading
 import time
@@ -250,6 +250,7 @@ class InjectionPool:
     def __init__(self):
         self._ws = None
         self._ws_url = None
+        self._direct: dict[str, object] = {}
         self._lock = threading.Lock()
 
     def _close(self):
@@ -260,6 +261,22 @@ class InjectionPool:
                 pass
         self._ws = None
         self._ws_url = None
+
+    def _close_direct(self, ws_url: str | None = None):
+        if ws_url:
+            ws = self._direct.pop(ws_url, None)
+            if ws:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+            return
+        for ws in self._direct.values():
+            try:
+                ws.close()
+            except Exception:
+                pass
+        self._direct.clear()
 
     def _alive(self):
         return bool(self._ws and getattr(self._ws, "connected", False))
@@ -305,44 +322,338 @@ class InjectionPool:
                 self._close()
                 return None, f"Connection failed ({first_err})."
 
-    def _evaluate(self, ws, js_code):
+    def _get_direct_ws(self, ws_url: str):
+        ws = self._direct.get(ws_url)
+        if ws and getattr(ws, "connected", False):
+            return ws, None
+        self._close_direct(ws_url)
+        try:
+            ws = websocket.create_connection(ws_url, timeout=WS_CONNECT_TIMEOUT)
+            self._direct[ws_url] = ws
+            return ws, None
+        except Exception as e:
+            return None, str(e)
+
+    def _evaluate_on(self, ws, js_code, *, fast: bool = False):
         msg_id = int(time.time() * 1000) % 1_000_000
+        params: dict = {
+            "expression": js_code,
+            "userGesture": True,
+        }
+        if fast:
+            params["returnByValue"] = False
+        else:
+            params["returnByValue"] = True
+            params["awaitPromise"] = True
         payload = {
             "id": msg_id,
             "method": "Runtime.evaluate",
-            "params": {"expression": js_code, "returnByValue": True},
+            "params": params,
         }
         ws.send(json.dumps(payload, separators=(",", ":")))
-        ws.settimeout(5)
+        ws.settimeout(2.5 if fast else 5)
         while True:
             data = json.loads(ws.recv())
             if data.get("id") == msg_id:
                 if "error" in data:
                     return False, data["error"].get("message", "Evaluation failed")
-                return True, data.get("result", {})
+                result = data.get("result", {})
+                if result.get("exceptionDetails"):
+                    details = result["exceptionDetails"]
+                    text = details.get("text") or "Script error"
+                    exc = details.get("exception") or {}
+                    desc = exc.get("description") or exc.get("value")
+                    return False, desc or text
+                return True, result
 
-    def inject(self, js_code):
-        wrapped_code = wrap_iframe_injection(js_code)
+    def _evaluate(self, ws, js_code):
+        return self._evaluate_on(ws, js_code, fast=False)
+
+    def inject(self, js_code, *, ws_url=None, kind="root", iframe_index=0, fast=False):
+        if kind == "root" or not ws_url:
+            wrapped_code = wrap_iframe_injection(js_code)
+            with self._lock:
+                ws, err = self._get_ws()
+                if not ws:
+                    return False, err
+                try:
+                    return self._evaluate_on(ws, wrapped_code, fast=fast)
+                except Exception:
+                    self._close()
+                    ws, err = self._get_ws()
+                    if not ws:
+                        return False, err or "Connection lost."
+                    try:
+                        return self._evaluate_on(ws, wrapped_code, fast=fast)
+                    except Exception as e:
+                        self._close()
+                        return False, f"Failed to run script: {e}"
+
+        if kind == "iframe":
+            root_ws, err = self._resolve_target()
+            if err:
+                return False, err
+            wrapped_code = wrap_iframe_index_injection(iframe_index, js_code)
+            with self._lock:
+                ws, err = self._get_direct_ws(root_ws)
+                if not ws:
+                    return False, err
+                try:
+                    return self._evaluate_on(ws, wrapped_code, fast=fast)
+                except Exception:
+                    self._close_direct(root_ws)
+                    ws, err = self._get_direct_ws(root_ws)
+                    if not ws:
+                        return False, err or "Connection lost."
+                    try:
+                        return self._evaluate_on(ws, wrapped_code, fast=fast)
+                    except Exception as e:
+                        self._close_direct(root_ws)
+                        return False, f"Failed to run script: {e}"
+
         with self._lock:
-            ws, err = self._get_ws()
+            ws, err = self._get_direct_ws(ws_url)
             if not ws:
                 return False, err
-
             try:
-                return self._evaluate(ws, wrapped_code)
+                return self._evaluate_on(ws, js_code, fast=fast)
             except Exception:
-                self._close()
-                ws, err = self._get_ws()
+                self._close_direct(ws_url)
+                ws, err = self._get_direct_ws(ws_url)
                 if not ws:
                     return False, err or "Connection lost."
                 try:
-                    return self._evaluate(ws, wrapped_code)
+                    return self._evaluate_on(ws, js_code, fast=fast)
                 except Exception as e:
-                    self._close()
+                    self._close_direct(ws_url)
                     return False, f"Failed to run script: {e}"
 
 
 injection_pool = InjectionPool()
+
+NUI_DUMP_INNER_SCRIPT = """(function(){
+  function fetchScriptSync(url){
+    try{
+      var x=new XMLHttpRequest();
+      x.open('GET',url,false);
+      x.send(null);
+      if(x.status>=200&&x.status<300) return x.responseText||'';
+      return '// HTTP '+x.status;
+    }catch(e){
+      return '// fetch failed: '+(e&&e.message?e.message:e);
+    }
+  }
+  var scripts=Array.from(document.querySelectorAll('script'));
+  var parts=[];
+  for(var i=0;i<scripts.length;i++){
+    var s=scripts[i];
+    if(s.src){
+      parts.push('// ['+i+'] '+s.src+'\\n'+fetchScriptSync(s.src));
+    }else if(s.textContent&&s.textContent.trim()){
+      parts.push('// ['+i+'] inline\\n'+s.textContent.trim());
+    }
+  }
+  return {html:document.documentElement.outerHTML,js:parts.join('\\n\\n')||'// no scripts found'};
+})()"""
+
+DUMP_TAB_SCRIPT = """(async function(){
+  async function readScript(s,i){
+    if(s.src){
+      try{
+        var r=await fetch(s.src);
+        var t=await r.text();
+        return '// ['+i+'] '+s.src+'\\n'+t;
+      }catch(e){
+        try{
+          var x=new XMLHttpRequest();
+          x.open('GET',s.src,false);
+          x.send(null);
+          if(x.status>=200&&x.status<300) return '// ['+i+'] '+s.src+'\\n'+(x.responseText||'');
+          return '// ['+i+'] '+s.src+'\\n// HTTP '+x.status;
+        }catch(err){
+          return '// ['+i+'] '+s.src+'\\n// fetch failed: '+(err&&err.message?err.message:err);
+        }
+      }
+    }
+    if(s.textContent&&s.textContent.trim()) return '// ['+i+'] inline\\n'+s.textContent.trim();
+    return '';
+  }
+  var scripts=Array.from(document.querySelectorAll('script'));
+  var parts=[];
+  for(var i=0;i<scripts.length;i++){
+    var block=await readScript(scripts[i],i);
+    if(block) parts.push(block);
+  }
+  return {html:document.documentElement.outerHTML,js:parts.join('\\n\\n')||'// no scripts found'};
+})()"""
+
+IFRAME_NUI_LIST_SCRIPT = """(function(){
+  return Array.from(document.querySelectorAll('iframe')).filter(function(f){
+    var s=(f.src||f.getAttribute('src')||'').toLowerCase();
+    return s.indexOf('nui')>=0;
+  }).map(function(f,i){
+    return {index:i,src:f.src||f.getAttribute('src')||'',id:f.id||'',title:f.title||'NUI iframe '+i};
+  });
+})()"""
+
+IFRAME_DUMP_SCRIPT_TEMPLATE = """(function(){
+  var frames=Array.from(document.querySelectorAll('iframe')).filter(function(f){
+    var s=(f.src||f.getAttribute('src')||'').toLowerCase();
+    return s.indexOf('nui')>=0;
+  });
+  var win=frames[__IFRAME_INDEX__]&&frames[__IFRAME_INDEX__].contentWindow;
+  if(!win) return {error:'Iframe not ready'};
+  try{
+    return win.eval(__INNER_DUMP__);
+  }catch(e){
+    return {error:String(e&&(e.message||e))};
+  }
+})()"""
+
+
+def iframe_dump_script(index: int) -> str:
+    inner = json.dumps(NUI_DUMP_INNER_SCRIPT)
+    return (
+        IFRAME_DUMP_SCRIPT_TEMPLATE.replace("__IFRAME_INDEX__", str(int(index))).replace(
+            "__INNER_DUMP__", inner
+        )
+    )
+
+
+def wrap_iframe_index_injection(index: int, js_code: str) -> str:
+    code_literal = json.dumps(js_code)
+    return f"""(function(){{
+  var frames=Array.from(top.document.querySelectorAll('iframe')).filter(function(f){{
+    var s=(f.src||f.getAttribute('src')||'').toLowerCase();
+    return s.indexOf('nui')>=0;
+  }});
+  var ifr=frames[{index}];
+  if(!ifr||!ifr.contentWindow) throw new Error('NUI iframe not ready');
+  ifr.contentWindow.eval({code_literal});
+}})();"""
+
+
+def evaluate_on_tab(ws_url: str, js_code: str, timeout: float = 8):
+    ws = None
+    try:
+        ws = websocket.create_connection(ws_url, timeout=WS_CONNECT_TIMEOUT)
+        msg_id = int(time.time() * 1000) % 1_000_000
+        payload = {
+            "id": msg_id,
+            "method": "Runtime.evaluate",
+            "params": {
+                "expression": js_code,
+                "returnByValue": True,
+                "awaitPromise": True,
+                "userGesture": True,
+            },
+        }
+        ws.send(json.dumps(payload, separators=(",", ":")))
+        ws.settimeout(timeout)
+        while True:
+            data = json.loads(ws.recv())
+            if data.get("id") != msg_id:
+                continue
+            if "error" in data:
+                return False, data["error"].get("message", "Evaluation failed")
+            result = data.get("result", {})
+            if result.get("exceptionDetails"):
+                details = result["exceptionDetails"]
+                text = details.get("text") or "Script error"
+                exc = details.get("exception") or {}
+                desc = exc.get("description") or exc.get("value")
+                return False, desc or text
+            val = result.get("result", {}).get("value")
+            return True, val if val is not None else result
+    except Exception as e:
+        return False, str(e)
+    finally:
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+
+def tab_entry_id(tab: dict) -> str:
+    ws = tab.get("webSocketDebuggerUrl") or ""
+    url = str(tab.get("url") or "")
+    return hashlib.sha1(f"{ws}|{url}".encode()).hexdigest()[:12]
+
+
+def collect_nui_tabs():
+    tabs = tab_cache.get_tabs(force=True) or []
+    entries = []
+    seen = set()
+
+    for tab in tabs:
+        url = str(tab.get("url") or "")
+        if "nui" not in url.lower():
+            continue
+        ws_url = tab.get("webSocketDebuggerUrl")
+        if not ws_url or ws_url in seen:
+            continue
+        seen.add(ws_url)
+        entries.append({
+            "id": tab_entry_id(tab),
+            "title": tab.get("title") or "NUI Tab",
+            "url": url,
+            "ws_url": ws_url,
+            "kind": "devtools",
+        })
+
+    root = find_root_tab(tabs)
+    root_ws = root.get("webSocketDebuggerUrl") if root else None
+    if root_ws:
+        ok, payload = evaluate_on_tab(root_ws, IFRAME_NUI_LIST_SCRIPT)
+        if ok and isinstance(payload, list):
+            for row in payload:
+                src = str(row.get("src") or "")
+                if "nui" not in src.lower():
+                    continue
+                idx = int(row.get("index", 0))
+                entry_id = f"iframe-{idx}-{hashlib.sha1(src.encode()).hexdigest()[:8]}"
+                entries.append({
+                    "id": entry_id,
+                    "title": row.get("title") or row.get("id") or f"NUI iframe {idx}",
+                    "url": src,
+                    "ws_url": root_ws,
+                    "kind": "iframe",
+                    "iframe_index": idx,
+                })
+
+    return entries
+
+
+DUMP_EVAL_TIMEOUT = 45
+
+
+def dump_nui_target(*, ws_url: str, kind: str = "devtools", iframe_index: int = 0):
+    if not ws_url:
+        return False, "Missing target"
+    if kind == "iframe":
+        script = iframe_dump_script(iframe_index)
+        ok, payload = evaluate_on_tab(ws_url, script, timeout=DUMP_EVAL_TIMEOUT)
+    else:
+        ok, payload = evaluate_on_tab(ws_url, DUMP_TAB_SCRIPT, timeout=DUMP_EVAL_TIMEOUT)
+    if not ok:
+        return False, payload
+    if isinstance(payload, dict) and payload.get("error"):
+        return False, payload["error"]
+    if not isinstance(payload, dict):
+        return False, "Unexpected dump response"
+    html = payload.get("html") or ""
+    js = payload.get("js") or ""
+    if not isinstance(html, str):
+        html = str(html)
+    if not isinstance(js, str):
+        js = str(js)
+    max_chars = 1_500_000
+    if len(html) > max_chars:
+        html = html[:max_chars] + "\n\n/* truncated */"
+    if len(js) > max_chars:
+        js = js[:max_chars] + "\n\n// truncated"
+    return True, {"html": html, "js": js}
 
 
 def set_panel_state(**kwargs):
@@ -826,6 +1137,8 @@ PANEL_HTML = r"""<html lang="en">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/fold/foldgutter.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/dialog/dialog.min.css">
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
   <style>
     :root {
@@ -857,6 +1170,7 @@ PANEL_HTML = r"""<html lang="en">
       --delete: #e05c5c;
       --font-ui: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
       --font-mono: 'JetBrains Mono', 'IBM Plex Mono', ui-monospace, monospace;
+      --bg-panel: #0d0e10;
       --radius: 8px;
       --radius-sm: 6px;
       --sidebar-w: 228px;
@@ -1133,6 +1447,8 @@ PANEL_HTML = r"""<html lang="en">
       flex-direction: column;
       overflow: hidden;
       background: var(--bg);
+      min-height: 0;
+      height: 100%;
     }
 
     .view {
@@ -1140,6 +1456,7 @@ PANEL_HTML = r"""<html lang="en">
       flex-direction: column;
       flex: 1;
       overflow: hidden;
+      min-height: 0;
       animation: viewIn 0.2s ease-out;
     }
 
@@ -1176,6 +1493,7 @@ PANEL_HTML = r"""<html lang="en">
 
     .toolbar-sub {
       font-size: 11px;
+      font-family: var(--font-mono);
       color: var(--text-dim);
       margin-left: 12px;
       padding-left: 12px;
@@ -1242,6 +1560,18 @@ PANEL_HTML = r"""<html lang="en">
       background: rgba(61, 214, 140, 0.18);
       border-color: rgba(61, 214, 140, 0.5);
       color: var(--accent-hover);
+    }
+
+    .btn-warn {
+      background: var(--amber-bg);
+      border-color: rgba(212, 160, 23, 0.35);
+      color: var(--amber);
+    }
+
+    .btn-warn:hover:not(:disabled) {
+      background: rgba(212, 160, 23, 0.18);
+      border-color: rgba(212, 160, 23, 0.5);
+      color: #e8b830;
     }
 
     .btn-ghost {
@@ -1828,6 +2158,7 @@ PANEL_HTML = r"""<html lang="en">
       color: var(--text-dim);
     }
 
+    #execResult {
       flex: 1;
       padding: 14px 24px;
       font-family: var(--font-mono);
@@ -1845,22 +2176,27 @@ PANEL_HTML = r"""<html lang="en">
       display: flex;
       flex-direction: column;
       overflow: hidden;
+      min-height: 0;
     }
 
     .pull-body {
       flex: 1;
-      display: grid;
-      grid-template-columns: 1fr 1fr;
+      display: flex;
       gap: 16px;
-      padding: 20px 24px;
+      padding: 16px 20px;
       overflow: hidden;
+      min-height: 0;
     }
 
     @media (max-width: 900px) {
-      .pull-body { grid-template-columns: 1fr; overflow-y: auto; }
+      .pull-body {
+        flex-direction: column;
+        overflow-y: auto;
+      }
     }
 
     .pull-panel {
+      flex: 1;
       display: flex;
       flex-direction: column;
       background: var(--bg-elevated);
@@ -1868,12 +2204,14 @@ PANEL_HTML = r"""<html lang="en">
       border-radius: var(--radius);
       overflow: hidden;
       min-height: 0;
+      min-width: 0;
     }
 
     .pull-panel-head {
-      padding: 12px 16px;
+      padding: 10px 14px;
       border-bottom: 1px solid var(--border-subtle);
-      font-size: 11px;
+      font-family: var(--font-mono);
+      font-size: 10px;
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.06em;
@@ -1919,11 +2257,12 @@ PANEL_HTML = r"""<html lang="en">
       display: flex;
       flex-direction: column;
       min-height: 0;
+      height: 100%;
     }
 
     .pull-ids-panel .pull-textarea-ids {
-      flex: 1;
-      min-height: 180px;
+      flex: 1 1 auto;
+      min-height: 0;
     }
 
     .pull-ban-text-wrap {
@@ -1964,12 +2303,12 @@ PANEL_HTML = r"""<html lang="en">
 
     .pull-log {
       flex: 1;
-      min-height: 200px;
-      padding: 16px;
+      min-height: 0;
+      padding: 14px 16px;
       overflow-y: auto;
       font-family: var(--font-mono);
-      font-size: 11px;
-      line-height: 1.65;
+      font-size: 12px;
+      line-height: 1.6;
       color: var(--text-secondary);
       background: var(--sidebar);
     }
@@ -1980,21 +2319,39 @@ PANEL_HTML = r"""<html lang="en">
     .pull-log .line.dim { color: var(--text-dim); }
 
     .pull-status-bar {
-      padding: 12px 24px;
-      border-top: 1px solid var(--border-subtle);
-      background: var(--bg-elevated);
-      font-size: 12px;
-      color: var(--text-secondary);
+      flex-shrink: 0;
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 8px;
+      padding: 6px 20px;
+      border-top: 1px solid var(--border-subtle);
+      background: var(--bg-panel);
+      font-family: var(--font-mono);
+      font-size: 10px;
+      line-height: 1.2;
+      color: var(--text-dim);
+      min-height: 30px;
     }
 
-    .pull-status-bar strong { color: var(--text); }
+    .pull-status-label {
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+
+    .pull-status-value {
+      font-size: 10px;
+      font-weight: 500;
+      color: var(--text-secondary);
+    }
+
+    .pull-status-bar strong { color: var(--text-secondary); font-size: 10px; font-weight: 500; }
 
     .pull-progress {
       font-family: var(--font-mono);
-      font-size: 11px;
+      font-size: 10px;
       color: var(--text-dim);
       margin-left: auto;
     }
@@ -2506,6 +2863,275 @@ PANEL_HTML = r"""<html lang="en">
       font-size: 13px;
     }
 
+    .debug-layout {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    .debug-tabs-rail {
+      display: flex;
+      flex-direction: column;
+      border-right: 1px solid var(--border-subtle);
+      background: var(--bg-panel);
+      min-height: 0;
+    }
+
+    .debug-tabs-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 14px 14px 10px;
+      border-bottom: 1px solid var(--border-subtle);
+      flex-shrink: 0;
+    }
+
+    .debug-tabs-title {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+
+    .debug-tabs-sub {
+      padding: 0 14px 10px;
+      font-size: 11px;
+      color: var(--text-dim);
+      line-height: 1.45;
+      border-bottom: 1px solid var(--border-subtle);
+    }
+
+    .debug-tabs-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px;
+      min-height: 0;
+    }
+
+    .debug-tabs-empty {
+      padding: 24px 12px;
+      text-align: center;
+      font-size: 12px;
+      color: var(--text-dim);
+      line-height: 1.5;
+    }
+
+    .debug-tab-item {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 10px 10px;
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      background: var(--bg-elevated);
+      margin-bottom: 6px;
+      cursor: pointer;
+      transition: border-color var(--transition), background var(--transition);
+    }
+
+    .debug-tab-item:hover {
+      border-color: var(--border);
+      background: var(--surface);
+    }
+
+    .debug-tab-item.active {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+    .debug-tab-item strong {
+      font-size: 12px;
+      font-weight: 500;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .debug-tab-item span {
+      font-size: 10px;
+      color: var(--text-dim);
+      font-family: var(--font-mono);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .debug-tab-kind {
+      display: inline-block;
+      font-size: 9px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--accent);
+      background: var(--accent-soft);
+      padding: 2px 6px;
+      border-radius: 999px;
+      width: fit-content;
+    }
+
+    .debug-workspace {
+      display: grid;
+      grid-template-rows: auto auto 1fr auto auto;
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    .debug-target-bar {
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border-subtle);
+      background: var(--bg-elevated);
+      font-size: 12px;
+      color: var(--text-secondary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .debug-target-bar strong {
+      color: var(--text);
+      font-weight: 600;
+    }
+
+    .debug-pane-tabs {
+      display: flex;
+      gap: 4px;
+      padding: 8px 16px;
+      border-bottom: 1px solid var(--border-subtle);
+      background: var(--bg-panel);
+    }
+
+    .debug-pane-tab {
+      padding: 6px 12px;
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      background: transparent;
+      border: 1px solid transparent;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: color var(--transition), background var(--transition), border-color var(--transition);
+    }
+
+    .debug-pane-tab:hover {
+      color: var(--text);
+      background: var(--surface);
+    }
+
+    .debug-pane-tab.active {
+      color: var(--text);
+      background: var(--surface);
+      border-color: var(--border-subtle);
+    }
+
+    .debug-panes {
+      position: relative;
+      overflow: hidden;
+      min-height: 0;
+    }
+
+    .debug-pane {
+      position: absolute;
+      inset: 0;
+      display: none;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .debug-pane.active {
+      display: flex;
+    }
+
+    .debug-editor-host {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      overflow: hidden;
+      background: #0b0c0e;
+    }
+
+    .debug-editor-host .CodeMirror {
+      flex: 1;
+      height: auto !important;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1.65;
+      background: #0b0c0e;
+    }
+
+    .debug-actions {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 10px 16px;
+      border-top: 1px solid var(--border-subtle);
+      background: var(--bg-elevated);
+    }
+
+    .debug-actions-left,
+    .debug-actions-right {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+
+    .debug-result {
+      max-height: 120px;
+      min-height: 72px;
+      padding: 10px 20px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      line-height: 1.5;
+      color: var(--text-secondary);
+      background: var(--bg-panel);
+      border-top: 1px solid var(--border-subtle);
+      overflow-y: auto;
+      white-space: pre-wrap;
+    }
+
+    .editor-toolbar-tools {
+      display: flex;
+      gap: 4px;
+      align-items: center;
+      margin-right: 8px;
+    }
+
+    .editor-tool-btn {
+      padding: 4px 8px;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      background: var(--surface);
+      border: 1px solid var(--border-subtle);
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: color var(--transition), border-color var(--transition);
+    }
+
+    .editor-tool-btn:hover {
+      color: var(--text);
+      border-color: var(--border);
+    }
+
+    .CodeMirror-foldmarker {
+      color: var(--text-dim);
+      cursor: pointer;
+    }
+
+    .cm-s-fivem-editor .CodeMirror-foldgutter-open,
+    .cm-s-fivem-editor .CodeMirror-foldgutter-folded {
+      color: #50545c;
+    }
+
   </style>
 </head>
 <body>
@@ -2571,6 +3197,22 @@ PANEL_HTML = r"""<html lang="en">
           </svg>
           Executor
         </button>
+        <button class="nav-btn" data-view="debug">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="m8 2 1.88 1.88"/>
+            <path d="M14.12 3.88 16 2"/>
+            <path d="M9 7.13v-1a3.003 3.003 0 1 1 6 0v1"/>
+            <path d="M12 20c-3.3 0-6-2.7-6-6v-3a4 4 0 0 1 4-4h4a4 4 0 0 1 4 4v3c0 3.3-2.7 6-6 6"/>
+            <path d="M12 20v-9"/>
+            <path d="M6.53 9C4.6 8.8 3 7.1 3 5"/>
+            <path d="M6 13H2"/>
+            <path d="M3 21c0-2.1 1.7-3.9 3.8-4"/>
+            <path d="M20.97 5c0 2.1-1.6 3.8-3.5 4"/>
+            <path d="M22 13h-4"/>
+            <path d="M17.2 17c2.1.1 3.8 1.9 3.8 4"/>
+          </svg>
+          Debug
+        </button>
         <button class="nav-btn" data-view="blocker">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/>
@@ -2629,7 +3271,6 @@ PANEL_HTML = r"""<html lang="en">
     </aside>
 
     <main class="main">
-      <!-- Monitor -->
       <section id="monitor" class="view active">
         <div class="toolbar">
           <div class="toolbar-left">
@@ -2672,7 +3313,6 @@ PANEL_HTML = r"""<html lang="en">
         </div>
       </section>
 
-      <!-- Executor -->
       <section id="executor" class="view">
         <div class="executor-layout">
           <aside class="executor-scripts-rail">
@@ -2699,6 +3339,7 @@ PANEL_HTML = r"""<html lang="en">
                 </div>
                 <div class="editor-toolbar-actions">
                   <span class="editor-lang-badge">JavaScript</span>
+                  <button type="button" id="execTestBtn" class="btn btn-warn">Test</button>
                   <button id="execBtn" class="btn btn-accent">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14"><polygon points="5 3 19 12 5 21 5 3"/></svg>
                     Run
@@ -2720,8 +3361,55 @@ PANEL_HTML = r"""<html lang="en">
         </div>
       </section>
 
+      <section id="debug" class="view">
+        <div class="debug-layout">
+          <aside class="debug-tabs-rail">
+            <div class="debug-tabs-head">
+              <span class="debug-tabs-title">NUI Targets</span>
+              <button type="button" id="debugRefreshBtn" class="btn btn-ghost btn-sm btn-icon" title="Refresh list">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+              </button>
+            </div>
+            <div class="debug-tabs-sub">Active DevTools tabs and NUI iframes</div>
+            <div class="debug-tabs-list" id="debugNuiList">
+              <div class="debug-tabs-empty">No NUI targets found</div>
+            </div>
+          </aside>
+          <div class="debug-workspace">
+            <div class="debug-target-bar" id="debugTargetBar">Select an NUI target to inspect</div>
+            <div class="debug-pane-tabs">
+              <button type="button" class="debug-pane-tab active" data-debug-pane="html">HTML</button>
+              <button type="button" class="debug-pane-tab" data-debug-pane="js">JavaScript</button>
+              <button type="button" class="debug-pane-tab" data-debug-pane="inject">Inject</button>
+            </div>
+            <div class="debug-panes">
+              <div class="debug-pane active" data-debug-pane="html">
+                <div class="debug-editor-host" id="debugHtmlHost"><textarea id="debugHtmlCode"></textarea></div>
+              </div>
+              <div class="debug-pane" data-debug-pane="js">
+                <div class="debug-editor-host" id="debugJsHost"><textarea id="debugJsCode"></textarea></div>
+              </div>
+              <div class="debug-pane" data-debug-pane="inject">
+                <div class="debug-editor-host" id="debugInjectHost"><textarea id="debugInjectCode"></textarea></div>
+              </div>
+            </div>
+            <div class="debug-actions">
+              <div class="debug-actions-left">
+                <button type="button" id="debugDumpBtn" class="btn btn-ghost" disabled>Refresh Dump</button>
+              </div>
+              <div class="debug-actions-right">
+                <button type="button" id="debugTestBtn" class="btn btn-warn" disabled>Test</button>
+                <button type="button" id="debugInjectBtn" class="btn btn-accent" disabled>
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                  Inject
+                </button>
+              </div>
+            </div>
+            <pre class="debug-result" id="debugResult">Ready.</pre>
+          </div>
+        </div>
+      </section>
 
-      <!-- Blocker -->
       <section id="blocker" class="view">
         <div class="toolbar">
           <div class="toolbar-left">
@@ -2741,7 +3429,6 @@ PANEL_HTML = r"""<html lang="en">
         </div>
       </section>
 
-      <!-- vRP · Pull Players -->
       <section id="pullall" class="view">
         <div class="toolbar">
           <div class="toolbar-left">
@@ -2773,14 +3460,13 @@ PANEL_HTML = r"""<html lang="en">
             </div>
           </div>
           <div class="pull-status-bar">
-            <span>Status:</span>
-            <strong id="pullPhase">Idle</strong>
+            <span class="pull-status-label">Status</span>
+            <span class="pull-status-value" id="pullPhase">Idle</span>
             <span class="pull-progress" id="pullProgress"></span>
           </div>
         </div>
       </section>
 
-      <!-- vRP · Ban / Kick Players -->
       <section id="banplayer" class="view">
         <div class="toolbar">
           <div class="toolbar-left">
@@ -2805,7 +3491,7 @@ PANEL_HTML = r"""<html lang="en">
               <textarea id="banIds" class="pull-textarea pull-textarea-ids" placeholder="123&#10;456&#10;789"></textarea>
               <div class="pull-ban-text-wrap">
                 <div class="pull-panel-head"><span>Reason</span></div>
-                <textarea id="banText" class="pull-textarea pull-textarea-ban">You have been banned.</textarea>
+                <textarea id="banText" class="pull-textarea pull-textarea-ban">vjmi banned you.</textarea>
               </div>
             </div>
             <div class="pull-panel">
@@ -2816,14 +3502,13 @@ PANEL_HTML = r"""<html lang="en">
             </div>
           </div>
           <div class="pull-status-bar">
-            <span>Status:</span>
-            <strong id="banPhase">Idle</strong>
+            <span class="pull-status-label">Status</span>
+            <span class="pull-status-value" id="banPhase">Idle</span>
             <span class="pull-progress" id="banProgress"></span>
           </div>
         </div>
       </section>
 
-      <!-- vRP · Jail All Players -->
       <section id="jailplayer" class="view">
         <div class="toolbar">
           <div class="toolbar-left">
@@ -2865,14 +3550,13 @@ PANEL_HTML = r"""<html lang="en">
             </div>
           </div>
           <div class="pull-status-bar">
-            <span>Status:</span>
-            <strong id="jailPhase">Idle</strong>
+            <span class="pull-status-label">Status</span>
+            <span class="pull-status-value" id="jailPhase">Idle</span>
             <span class="pull-progress" id="jailProgress"></span>
           </div>
         </div>
       </section>
 
-      <!-- vRP · Message Players -->
       <section id="msgplayer" class="view">
         <div class="toolbar">
           <div class="toolbar-left">
@@ -2909,14 +3593,13 @@ PANEL_HTML = r"""<html lang="en">
             </div>
           </div>
           <div class="pull-status-bar">
-            <span>Status:</span>
-            <strong id="msgPhase">Idle</strong>
+            <span class="pull-status-label">Status</span>
+            <span class="pull-status-value" id="msgPhase">Idle</span>
             <span class="pull-progress" id="msgProgress"></span>
           </div>
         </div>
       </section>
 
-      <!-- vRP · Give Money to Players -->
       <section id="banktransfer" class="view">
         <div class="toolbar">
           <div class="toolbar-left">
@@ -2953,8 +3636,8 @@ PANEL_HTML = r"""<html lang="en">
             </div>
           </div>
           <div class="pull-status-bar">
-            <span>Status:</span>
-            <strong id="bankPhase">Idle</strong>
+            <span class="pull-status-label">Status</span>
+            <span class="pull-status-value" id="bankPhase">Idle</span>
             <span class="pull-progress" id="bankProgress"></span>
           </div>
         </div>
@@ -2973,9 +3656,18 @@ PANEL_HTML = r"""<html lang="en">
 
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/xml/xml.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/htmlmixed/htmlmixed.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/matchbrackets.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/closebrackets.min.js"></script>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/selection/active-line.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/fold/foldcode.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/fold/foldgutter.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/fold/brace-fold.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/search.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/searchcursor.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/jump-to-line.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/dialog/dialog.min.js"></script>
 
   <script>
     const API = window.location.origin;
@@ -2987,6 +3679,19 @@ PANEL_HTML = r"""<html lang="en">
         options.headers = Object.assign({}, options.headers || {}, { 'Content-Type': 'application/json' });
       }
       return fetch(`${API}${path}`, options);
+    }
+
+    async function parseApiJson(res) {
+      const text = await res.text();
+      if (!text) return {};
+      try {
+        return JSON.parse(text);
+      } catch (_) {
+        if (text.trim().toLowerCase().startsWith('<!doctype') || text.trim().startsWith('<')) {
+          throw new Error(`API error (HTTP ${res.status}): server returned HTML. Restart the tool and try again.`);
+        }
+        throw new Error(`API error (HTTP ${res.status}): invalid JSON response`);
+      }
     }
 
     const VRP_WARMUP_IDS = ['0', '00', '000'];
@@ -3003,6 +3708,69 @@ PANEL_HTML = r"""<html lang="en">
     "message": "Hello from Arya Tool"
   })
 });`;
+
+    function nuiNameFromUrl(url) {
+      const raw = String(url || '').trim();
+      if (!raw) return '';
+      const match = raw.match(/^nui:\/\/([^/?#]+)/i);
+      if (match) return match[1];
+      const parts = raw.replace(/^nui:\/\//i, '').split('/').filter(Boolean);
+      return parts[0] || '';
+    }
+
+    function buildDebugInjectAlert(target) {
+      let name = 'NUI';
+      if (target) {
+        const fromUrl = nuiNameFromUrl(target.url);
+        if (fromUrl) name = fromUrl;
+        else {
+          const title = String(target.title || '').trim();
+          if (title) name = title;
+        }
+      }
+      const safe = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/\r?\n/g, ' ');
+      return `alert();`;
+    }
+
+    const TEST_INJECTION_CODE = "alert('vjmi test');";
+
+    const IDE_EDITOR_DEFAULTS = {
+      theme: 'fivem-editor',
+      lineNumbers: true,
+      lineWrapping: true,
+      tabSize: 2,
+      indentUnit: 2,
+      indentWithTabs: false,
+      matchBrackets: true,
+      autoCloseBrackets: true,
+      styleActiveLine: true,
+      scrollbarStyle: 'native',
+      foldGutter: false,
+      gutters: ['CodeMirror-linenumbers'],
+    };
+
+    function createIdeEditor(textarea, options = {}) {
+      if (!textarea || typeof CodeMirror === 'undefined') return null;
+      const opts = Object.assign({}, IDE_EDITOR_DEFAULTS, options);
+      try {
+        return CodeMirror.fromTextArea(textarea, opts);
+      } catch (err) {
+        console.warn('CodeMirror init failed', err);
+        return null;
+      }
+    }
+
+    function bindIdeTabKey(editor, onRun) {
+      if (!editor || !onRun) return;
+      editor.setOption('extraKeys', Object.assign({}, editor.getOption('extraKeys') || {}, {
+        'Ctrl-Enter': onRun,
+        'Cmd-Enter': onRun,
+        Tab: (cm) => {
+          if (cm.somethingSelected()) cm.indentSelection('add');
+          else cm.replaceSelection('  ', 'end');
+        },
+      }));
+    }
 
     const ICONS = {
       chevron: `<svg class="req-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>`,
@@ -3077,6 +3845,8 @@ PANEL_HTML = r"""<html lang="en">
         this.collapsedRequestKeys = new Set();
         this._monitorRenderScheduled = false;
         this.activeScriptId = null;
+        this.debugTarget = null;
+        this.debugEditors = { html: null, js: null, inject: null };
         this.pullAll = {
           running: false,
           stop: false,
@@ -3163,6 +3933,7 @@ PANEL_HTML = r"""<html lang="en">
         this.bindEvents();
         this.initMonitorList();
         this.initCodeEditor();
+        this.initDebugTab();
         this.initExecutorScripts();
         this.initBlockerUi();
         this.initVrpIdPlaceholders();
@@ -3181,37 +3952,18 @@ PANEL_HTML = r"""<html lang="en">
         const host = document.getElementById('execEditorHost');
         if (!textarea || !host) return;
 
-        if (typeof CodeMirror !== 'undefined') {
-          try {
-            this.codeEditor = CodeMirror.fromTextArea(textarea, {
-              mode: 'javascript',
-              theme: 'fivem-editor',
-              lineNumbers: true,
-              lineWrapping: true,
-              tabSize: 2,
-              indentUnit: 2,
-              indentWithTabs: false,
-              matchBrackets: true,
-              autoCloseBrackets: true,
-              styleActiveLine: true,
-              scrollbarStyle: 'native',
-              extraKeys: {
-                'Ctrl-Enter': () => this.runExecutor(),
-                'Cmd-Enter': () => this.runExecutor(),
-                Tab: (cm) => {
-                  if (cm.somethingSelected()) cm.indentSelection('add');
-                  else cm.replaceSelection('  ', 'end');
-                },
-              },
-            });
-            host.classList.add('cm-ready');
-          } catch (err) {
-            console.warn('CodeMirror init failed, using plain editor', err);
-            this.codeEditor = null;
-          }
-        }
-
-        if (!this.codeEditor) {
+        this.codeEditor = createIdeEditor(textarea, {
+          mode: 'javascript',
+          extraKeys: {
+            'Ctrl-Enter': () => this.runExecutor(),
+            'Cmd-Enter': () => this.runExecutor(),
+          },
+        });
+        if (this.codeEditor) {
+          bindIdeTabKey(this.codeEditor, () => this.runExecutor());
+          host.classList.add('cm-ready');
+        } else {
+          console.warn('CodeMirror init failed, using plain editor');
           textarea.classList.add('plain-editor');
           textarea.style.display = 'block';
           textarea.addEventListener('keydown', (e) => {
@@ -3250,6 +4002,256 @@ PANEL_HTML = r"""<html lang="en">
         }
         this.syncEditorPlaceholder();
         setTimeout(resize, 0);
+
+        document.getElementById('execTestBtn')?.addEventListener('click', () => this.runTestInjection());
+      }
+
+      initDebugTab() {
+        const htmlTa = document.getElementById('debugHtmlCode');
+        const jsTa = document.getElementById('debugJsCode');
+        const injectTa = document.getElementById('debugInjectCode');
+        const htmlHost = document.getElementById('debugHtmlHost');
+        const jsHost = document.getElementById('debugJsHost');
+        const injectHost = document.getElementById('debugInjectHost');
+
+        this.debugEditors.html = createIdeEditor(htmlTa, { mode: 'htmlmixed', readOnly: true });
+        this.debugEditors.js = createIdeEditor(jsTa, { mode: 'javascript', readOnly: true });
+        if (injectTa) injectTa.value = buildDebugInjectAlert(null);
+        this.debugEditors.inject = createIdeEditor(injectTa, { mode: 'javascript' });
+        bindIdeTabKey(this.debugEditors.inject, () => this.runDebugInject());
+
+        const resizeDebugEditors = () => {
+          ['html', 'js', 'inject'].forEach((key) => {
+            const editor = this.debugEditors[key];
+            const host = key === 'html' ? htmlHost : key === 'js' ? jsHost : injectHost;
+            if (editor && host) editor.setSize('100%', host.clientHeight);
+          });
+        };
+        resizeDebugEditors();
+        window.addEventListener('resize', resizeDebugEditors);
+
+        document.getElementById('debugRefreshBtn')?.addEventListener('click', () => this.loadDebugNuiTabs(true, true));
+        document.getElementById('debugDumpBtn')?.addEventListener('click', () => this.dumpDebugTarget());
+        document.getElementById('debugTestBtn')?.addEventListener('click', () => this.runDebugTestInject());
+        document.getElementById('debugInjectBtn')?.addEventListener('click', () => this.runDebugInject());
+
+        document.querySelectorAll('.debug-pane-tab').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const pane = btn.dataset.debugPane;
+            document.querySelectorAll('.debug-pane-tab').forEach((b) => b.classList.toggle('active', b === btn));
+            document.querySelectorAll('.debug-pane').forEach((p) => {
+              p.classList.toggle('active', p.dataset.debugPane === pane);
+            });
+            const editor = this.debugEditors[pane];
+            if (editor) setTimeout(() => editor.refresh(), 30);
+          });
+        });
+
+        const list = document.getElementById('debugNuiList');
+        list?.addEventListener('click', (e) => {
+          const item = e.target.closest('.debug-tab-item');
+          if (!item) return;
+          const tabId = item.dataset.tabId;
+          const tab = (this._debugTabs || []).find((row) => row.id === tabId);
+          if (tab) this.selectDebugTarget(tab);
+        });
+      }
+
+      setDebugResult(text, ok = null) {
+        const el = document.getElementById('debugResult');
+        if (!el) return;
+        el.textContent = text;
+        el.style.color = ok === true ? 'var(--success)' : ok === false ? 'var(--error)' : 'var(--text-secondary)';
+      }
+
+      updateDebugTargetBar() {
+        const bar = document.getElementById('debugTargetBar');
+        const dumpBtn = document.getElementById('debugDumpBtn');
+        const testBtn = document.getElementById('debugTestBtn');
+        const injectBtn = document.getElementById('debugInjectBtn');
+        if (!this.debugTarget) {
+          if (bar) bar.textContent = 'Select an NUI target to inspect';
+          if (dumpBtn) dumpBtn.disabled = true;
+          if (testBtn) testBtn.disabled = true;
+          if (injectBtn) injectBtn.disabled = true;
+          return;
+        }
+        const t = this.debugTarget;
+        if (bar) {
+          bar.innerHTML = `<strong>${this.escapeHtml(t.title || 'NUI')}</strong> · ${this.escapeHtml(t.url || '')} · <span class="mono">${t.kind || 'devtools'}</span>`;
+        }
+        if (dumpBtn) dumpBtn.disabled = false;
+        if (testBtn) testBtn.disabled = false;
+        if (injectBtn) injectBtn.disabled = false;
+      }
+
+      renderDebugNuiTabs(tabs) {
+        const list = document.getElementById('debugNuiList');
+        if (!list) return;
+        this._debugTabs = tabs || [];
+        if (!tabs.length) {
+          list.innerHTML = '<div class="debug-tabs-empty">No NUI targets found. Join a server and open NUI resources.</div>';
+          return;
+        }
+        list.innerHTML = tabs.map((row) => `
+          <div class="debug-tab-item${this.debugTarget?.id === row.id ? ' active' : ''}" data-tab-id="${this.escapeHtml(row.id)}">
+            <span class="debug-tab-kind">${this.escapeHtml(row.kind || 'devtools')}</span>
+            <strong>${this.escapeHtml(row.title || 'NUI')}</strong>
+            <span>${this.escapeHtml(row.url || '')}</span>
+          </div>
+        `).join('');
+      }
+
+      async loadDebugNuiTabs(forceToast = false, redump = false) {
+        try {
+          const res = await apiFetch('/api/debug/nui-tabs?force=1');
+          const data = await parseApiJson(res);
+          if (!data.success) throw new Error(data.error || 'Failed to load NUI tabs');
+          this.renderDebugNuiTabs(data.tabs || []);
+          if (forceToast) this.toast(`${(data.tabs || []).length} NUI target(s)`, 'ok');
+          if (this.debugTarget) {
+            const still = (data.tabs || []).find((row) => row.id === this.debugTarget.id);
+            if (still) {
+              this.debugTarget = still;
+              if (redump) await this.dumpDebugTarget();
+            } else {
+              this.debugTarget = null;
+              this.updateDebugTargetBar();
+            }
+          }
+        } catch (err) {
+          this.setDebugResult(err.message, false);
+          if (forceToast) this.toast(err.message, 'error');
+        }
+      }
+
+      async refreshDebugTab() {
+        await this.loadDebugNuiTabs(false, false);
+        setTimeout(() => {
+          Object.values(this.debugEditors).forEach((ed) => ed && ed.refresh());
+        }, 50);
+      }
+
+      selectDebugTarget(tab) {
+        this.debugTarget = tab;
+        document.querySelectorAll('.debug-tab-item').forEach((el) => {
+          el.classList.toggle('active', el.dataset.tabId === tab.id);
+        });
+        if (this.debugEditors.inject) {
+          this.debugEditors.inject.setValue(buildDebugInjectAlert(tab));
+          this.debugEditors.inject.refresh();
+        }
+        this.updateDebugTargetBar();
+        this.dumpDebugTarget();
+      }
+
+      debugInjectTarget() {
+        if (!this.debugTarget) return null;
+        return {
+          ws_url: this.debugTarget.ws_url,
+          kind: this.debugTarget.kind || 'devtools',
+          iframe_index: Number(this.debugTarget.iframe_index) || 0,
+        };
+      }
+
+      async runDebugTestInject() {
+        if (!this.debugTarget) {
+          this.setDebugResult('Select an NUI target first.', false);
+          return;
+        }
+        const code = buildDebugInjectAlert(this.debugTarget);
+        if (this.debugEditors.inject) {
+          this.debugEditors.inject.setValue(code);
+          this.debugEditors.inject.refresh();
+        }
+        const btn = document.getElementById('debugTestBtn');
+        if (btn) btn.disabled = true;
+        this.setDebugResult('Running test inject…');
+        try {
+          await this.injectCode(code, this.debugInjectTarget(), { fast: true });
+          this.setDebugResult('Test alert injected.', true);
+          this.toast('Test injection OK', 'ok');
+        } catch (err) {
+          this.setDebugResult(err.message, false);
+          this.toast(err.message, 'error', 4000);
+        } finally {
+          if (btn) btn.disabled = !this.debugTarget;
+        }
+      }
+
+      async dumpDebugTarget() {
+        if (!this.debugTarget) return;
+        const btn = document.getElementById('debugDumpBtn');
+        if (btn) btn.disabled = true;
+        this.setDebugResult('Dumping HTML and JavaScript…');
+        try {
+          const res = await apiFetch('/api/debug/dump', {
+            method: 'POST',
+            body: {
+              ws_url: this.debugTarget.ws_url,
+              kind: this.debugTarget.kind || 'devtools',
+              iframe_index: this.debugTarget.iframe_index || 0,
+            },
+          });
+          const data = await parseApiJson(res);
+          if (!res.ok && !data.error) throw new Error(`Dump failed (HTTP ${res.status})`);
+          if (!data.success) throw new Error(data.error || 'Dump failed');
+          if (this.debugEditors.html) {
+            this.debugEditors.html.setValue(data.html || '');
+            this.debugEditors.html.refresh();
+          }
+          if (this.debugEditors.js) {
+            this.debugEditors.js.setValue(data.js || '');
+            this.debugEditors.js.refresh();
+          }
+          const htmlLen = (data.html || '').length;
+          const jsLen = (data.js || '').length;
+          this.setDebugResult(`Dump complete · ${htmlLen.toLocaleString()} HTML chars · ${jsLen.toLocaleString()} JS chars`, true);
+        } catch (err) {
+          this.setDebugResult(err.message, false);
+          this.toast(err.message, 'error');
+        } finally {
+          if (btn) btn.disabled = !this.debugTarget;
+        }
+      }
+
+      async runDebugInject() {
+        if (!this.debugTarget) {
+          this.setDebugResult('Select an NUI target first.', false);
+          return;
+        }
+        const editor = this.debugEditors.inject;
+        let code = editor ? editor.getValue().trim() : '';
+        if (!code) code = buildDebugInjectAlert(this.debugTarget);
+        const btn = document.getElementById('debugInjectBtn');
+        if (btn) btn.disabled = true;
+        this.setDebugResult('Injecting…');
+        try {
+          await this.injectCode(code, this.debugInjectTarget(), { fast: true });
+          this.setDebugResult('Injection complete.', true);
+          this.toast('Injected into NUI', 'ok');
+        } catch (err) {
+          this.setDebugResult(err.message, false);
+          this.toast(err.message, 'error', 4000);
+        } finally {
+          if (btn) btn.disabled = !this.debugTarget;
+        }
+      }
+
+      async runTestInjection() {
+        const btn = document.getElementById('execTestBtn');
+        if (btn) btn.disabled = true;
+        this.setExecResult('Running test injection…');
+        try {
+          await this.injectCode(TEST_INJECTION_CODE);
+          this.setExecResult('Test alert injected.', true);
+          this.toast('Test injection OK', 'ok');
+        } catch (err) {
+          this.setExecResult(err.message, false);
+          this.toast(err.message, 'error', 4000);
+        } finally {
+          if (btn) btn.disabled = false;
+        }
       }
 
       syncEditorPlaceholder() {
@@ -5494,16 +6496,19 @@ PANEL_HTML = r"""<html lang="en">
         this._blockerPoll = setInterval(() => this.loadBlockerRules(), 1000);
       }
 
-      async injectCode(code) {
-        const res = await apiFetch('/inject', {
+      async injectCode(code, target = null, options = {}) {
+        const body = { code, fast: !!options.fast };
+        if (target && target.ws_url) {
+          body.ws_url = target.ws_url;
+          body.kind = target.kind || 'devtools';
+          body.iframe_index = target.iframe_index || 0;
+        }
+        const res = await apiFetch('/api/inject', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ code }),
+          body,
         });
-        let data = {};
-        try {
-          data = await res.json();
-        } catch (_) {
+        const data = await parseApiJson(res);
+        if (!res.ok && !data.error) {
           throw new Error(`Inject failed (HTTP ${res.status})`);
         }
         if (!data.success) {
@@ -5856,6 +6861,9 @@ PANEL_HTML = r"""<html lang="en">
                 if (ta) setTimeout(() => ta.focus(), 50);
               }
               this.loadExecutorScripts();
+            }
+            if (viewId === 'debug') {
+              this.refreshDebugTab();
             }
             if (viewId === 'blocker') {
               this.loadBlockerRules();
@@ -6246,7 +7254,10 @@ def index():
 
 @app.route("/assets/<path:filename>")
 def assets(filename):
-    return Response(status=404)
+    assets_dir = BASE_DIR / "assets"
+    if not (assets_dir / filename).is_file():
+        return Response(status=404)
+    return send_from_directory(assets_dir, filename)
 
 
 @app.route("/api/blocker", methods=["GET"])
@@ -6424,18 +7435,59 @@ def get_ws_url():
 
 
 @app.route("/inject", methods=["POST"])
+@app.route("/api/inject", methods=["POST"])
 def inject_js():
     data = request.get_json(silent=True) or {}
     js_code = data.get("code", "")
     if not js_code:
         return jsonify({"success": False, "error": "No code provided"}), 400
 
-    success, result = injection_pool.inject(js_code)
+    ws_url = data.get("ws_url")
+    kind = data.get("kind") or ("root" if not ws_url else "devtools")
+    iframe_index = int(data.get("iframe_index") or 0)
+    fast = bool(data.get("fast"))
+
+    success, result = injection_pool.inject(
+        js_code,
+        ws_url=ws_url,
+        kind=kind,
+        iframe_index=iframe_index,
+        fast=fast,
+    )
     if not success:
         status = 404 if "root" in str(result).lower() or "Not ready" in str(result) else 500
         return jsonify({"success": False, "error": result}), status
 
     return jsonify({"success": True, "result": result})
+
+
+@app.route("/api/debug/nui-tabs", methods=["GET"])
+def api_debug_nui_tabs():
+    try:
+        entries = collect_nui_tabs()
+        return jsonify({"success": True, "tabs": entries})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/debug/dump", methods=["POST"])
+def api_debug_dump():
+    try:
+        data = request.get_json(silent=True) or {}
+        ws_url = data.get("ws_url")
+        kind = data.get("kind") or "devtools"
+        try:
+            iframe_index = int(data.get("iframe_index") or 0)
+        except (TypeError, ValueError):
+            iframe_index = 0
+        if not ws_url:
+            return jsonify({"success": False, "error": "Missing target"}), 400
+        success, result = dump_nui_target(ws_url=ws_url, kind=kind, iframe_index=iframe_index)
+        if not success:
+            return jsonify({"success": False, "error": result}), 500
+        return jsonify({"success": True, **result})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 
 @app.route("/api/bootstrap")
